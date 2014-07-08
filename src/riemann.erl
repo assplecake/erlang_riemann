@@ -63,10 +63,12 @@
     tcp_socket = undefined,
     udp_socket = undefined,
     host,
-    port
+    port,
+    tcp_last_retry
 }).
 
 -define(UDP_MAX_SIZE, 16384).
+-define(TCP_RETRY_THRESHOLD, 5000000). % 5 seconds before we retry a tcp connection
 
 -opaque riemann_event() :: #riemannevent{}.
 -opaque riemann_state() :: #riemannstate{}.
@@ -161,12 +163,7 @@ stop() ->
 %%%===================================================================
 
 init([]) ->
-  case setup_riemann_connectivity(#state{}) of
-    {error, Reason} ->
-      lager:error("Could not setup connections to riemann: ~p", [Reason]),
-      {stop, {shutdown, Reason}};
-    Other -> Other
-  end.
+  setup_riemann_connectivity(#state{}).
 
 handle_call({send, Entities}, _From, S0) ->
   {Reply, S1} = case send_entities(Entities, S0) of
@@ -195,6 +192,9 @@ handle_cast(_Msg, State) ->
 handle_info(_Info, State) ->
   {noreply, State}.
 
+terminate(_Reason, #state{udp_socket=UdpSocket, tcp_socket=undefined}) ->
+  gen_udp:close(UdpSocket),
+  ok;
 terminate(_Reason, #state{udp_socket=UdpSocket, tcp_socket=TcpSocket}) ->
   gen_udp:close(UdpSocket),
   gen_tcp:close(TcpSocket),
@@ -229,8 +229,8 @@ setup_tcp_socket(#state{tcp_socket=undefined, host=Host, port=Port}=S) ->
       ok = gen_tcp:controlling_process(TcpSocket, self()),
       {ok, S#state{tcp_socket = TcpSocket}};
     {error, Reason} ->
-      lager:error("Failed opening a Tcp socket to riemann with reason ~p", [Reason]),
-      {error, Reason}
+      lager:warning("Failed opening a Tcp socket to riemann with reason ~p. We'll retry later", [Reason]),
+      {ok, S#state{tcp_last_retry = os:timestamp()}}
   end;
 setup_tcp_socket(S) -> S.
 
@@ -265,6 +265,14 @@ send_entities(Entities, State) ->
       {send_with_udp(BinMsg, State), State}
   end.
 
+send_with_tcp(Msg, #state{tcp_socket=undefined, tcp_last_retry=LastRetry}=S0) ->
+  case timer:now_diff(os:timestamp(), LastRetry) > ?TCP_RETRY_THRESHOLD of
+    true ->
+      {ok, S} = setup_tcp_socket(S0),
+      send_with_tcp(Msg, S);
+    false ->
+      {error, no_tcp_connection}
+  end;
 send_with_tcp(Msg, #state{tcp_socket=TcpSocket}=S) ->
   MessageSize = byte_size(Msg),
   MsgWithLength = <<MessageSize:32/integer-big, Msg/binary>>,
@@ -494,6 +502,10 @@ end_to_end_tcp(Es, Validate) ->
   gen_tcp:close(Socket),
   (C#c.close)(),
   receive {result, ok} -> ok end,
+  stop().
+
+no_tcp_conn_test() ->
+  start_link(),
   stop().
 
 -endif.
